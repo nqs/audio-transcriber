@@ -19,30 +19,163 @@ Designed to drop into an Obsidian vault repo (or any repo that holds audio).
 | `.python-version` | Pins Python 3.11.9 for `pyenv` users (local only). |
 | `.gitignore` | Ignores local secrets / venv / OS cruft for *this* dev folder. |
 
-## Install into a vault repo
+## Install into a repo
 
-Use the helper script:
+There are two supported ways to drop the transcriber into a target repo
+(a vault, a recordings repo, etc.):
+
+1. **Copy-paste** — files are owned by the target repo. Simplest to
+   customize; updates require re-copying.
+2. **Git submodule** — the transcriber lives in a subdirectory pinned to a
+   commit of this repo. Updates are a `git submodule update --remote`. You
+   still write a thin workflow file in the target repo that calls the
+   submodule's script.
+
+Pick one. Don't mix them in the same repo.
+
+### Option A — Copy-paste (helper script)
+
+From a clone of this repo:
 
 ```bash
-/path/to/transcriber/scripts/install-into.sh /path/to/your/vault
+/path/to/audio-transcriber/scripts/install-into.sh /path/to/your/repo
 ```
 
 It copies `transcribe.sh`, `.github/workflows/transcribe.yml`, and
-`.python-version` into the vault, and appends the ignore rules from
-`gitignore.template` to the vault's `.gitignore` (idempotent — running it
+`.python-version` into the target, and appends the ignore rules from
+`gitignore.template` to the target's `.gitignore` (idempotent — running it
 again won't duplicate the lines).
 
-Or do the same thing manually:
+### Option B — Copy-paste (manual)
 
 ```bash
-SRC=/path/to/this/transcriber
+SRC=/path/to/audio-transcriber
 rsync -av \
   --exclude='.git/' --exclude='.DS_Store' --exclude='whisper-env/' \
   --exclude='huggingface.token' --exclude='session_*.*' \
   --exclude='.gitignore' --exclude='gitignore.template' \
-  --exclude='README.md' --exclude='scripts/' \
+  --exclude='README.md' --exclude='scripts/' --exclude='tests/' \
   "$SRC"/ ./
 cat "$SRC/gitignore.template" >> .gitignore
+```
+
+### Option C — Git submodule
+
+GitHub Actions only runs workflows that live in the consumer repo's own
+`.github/workflows/` directory, so the submodule approach uses a thin
+wrapper workflow that calls the script from the submodule.
+
+From inside the target repo:
+
+```bash
+# 1. Add this repo as a submodule.
+git submodule add https://github.com/nqs/audio-transcriber.git audio-transcriber
+
+# 2. Append the ignore rules.
+cat audio-transcriber/gitignore.template >> .gitignore
+
+# 3. Create a wrapper workflow (see contents below).
+mkdir -p .github/workflows
+$EDITOR .github/workflows/transcribe.yml
+
+git add .gitmodules audio-transcriber .gitignore .github/workflows/transcribe.yml
+git commit -m "Add audio-transcriber submodule"
+```
+
+Wrapper workflow contents — paste this into
+`.github/workflows/transcribe.yml` in the **target** repo. It is the same
+workflow shipped in this repo, with two differences: `submodules:
+recursive` on checkout, and the script path prefixed with
+`audio-transcriber/`.
+
+```yaml
+name: Transcribe audio
+
+on:
+  push:
+    paths:
+      - '**.m4a'
+      - '**.mp3'
+      - '**.wav'
+      - '**.webm'
+      - '**.flac'
+      - '**.ogg'
+  workflow_dispatch:
+    inputs:
+      all-files:
+        description: 'Transcribe every audio file in the repo (backfill)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+          lfs: true
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11.9'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Find audio files to transcribe
+        id: find
+        env:
+          ALL_FILES: ${{ inputs.all-files }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          regex='\.(m4a|mp3|wav|webm|flac|ogg)$'
+          if [ "${ALL_FILES:-false}" = "true" ]; then
+            git ls-files | grep -Ei "$regex" > audio_files.txt || true
+          else
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BEFORE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+            fi
+            if [ -n "$BEFORE" ]; then
+              git diff --name-only --diff-filter=AM "$BEFORE" HEAD \
+                | grep -Ei "$regex" > audio_files.txt || true
+            else
+              git ls-files | grep -Ei "$regex" > audio_files.txt || true
+            fi
+          fi
+          count=$(wc -l < audio_files.txt | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Transcribe
+        if: steps.find.outputs.count != '0'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SKIP_PYENV: '1'
+        run: |
+          chmod +x ./audio-transcriber/transcribe.sh
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            ./audio-transcriber/transcribe.sh "$f" "$f.txt" \
+              || echo "::warning::Failed to transcribe $f"
+          done < audio_files.txt
+          rm -f audio_files.txt
+      - name: Commit transcripts
+        if: steps.find.outputs.count != '0'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- ':(glob)**/*.txt'
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "chore: add transcripts [skip ci]"
+          git push
+```
+
+To pull future updates of the transcriber into the target repo:
+
+```bash
+git submodule update --remote audio-transcriber
+git add audio-transcriber
+git commit -m "Bump audio-transcriber"
 ```
 
 ### One-time GitHub setup
@@ -70,6 +203,9 @@ cat "$SRC/gitignore.template" >> .gitignore
 
 Requires `pyenv` with Python 3.11.9 installed. On first run the script
 creates `whisper-env/` and installs `whisperx` into it.
+
+If you installed via submodule, prefix the script path with the submodule
+directory (e.g. `./audio-transcriber/transcribe.sh ...`).
 
 ```bash
 # One-time: write your Hugging Face token to a file
@@ -110,14 +246,12 @@ HF_TOKEN=hf_xxx... ./transcribe.sh my-recording.m4a
   GitHub-hosted runner (ephemeral, single-tenant); be mindful on shared
   systems.
 
-## Keeping the template up to date
+## Keeping the install up to date
 
-This template is distributed by copy-paste — copies will drift from the
-source over time. To make updates easier across multiple vault repos,
-consider one of:
-
-- **`git subtree`**: pull updates from this repo into a subdirectory of the
-  vault while still owning the files locally.
-- **Composite GitHub Action**: convert this into an action that vaults
-  reference via `uses: <owner>/<repo>@v1`. Smaller footprint per vault, easy
-  version bumps, but vaults can't customize the script as freely.
+- **Copy-paste installs** drift from this repo over time. Re-run
+  `scripts/install-into.sh` (or repeat the manual `rsync`) to refresh
+  `transcribe.sh`, the workflow, and `.python-version`.
+- **Submodule installs** update with
+  `git submodule update --remote audio-transcriber` followed by a commit
+  of the new submodule pointer. The wrapper workflow in your repo only
+  needs editing if the upstream `transcribe.sh` CLI changes.

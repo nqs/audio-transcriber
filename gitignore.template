@@ -1,0 +1,8 @@
+# --- whisperx transcriber ---
+# Append these lines to your repo's existing .gitignore.
+
+# Hugging Face token used for local runs (never commit secrets).
+huggingface.token
+
+# Python virtualenv created by transcribe.sh for local runs.
+whisper-env/

@@ -1,0 +1,21 @@
+# Secrets
+huggingface.token
+
+# Python venv
+whisper-env/
+
+# OS / editor cruft
+.DS_Store
+
+# Scratch files used while iterating on the template
+.run_id
+
+# Local test artifacts (sample audio + transcripts used while developing
+# the template; the vault repo it's copied into WILL want to commit these).
+session_*.m4a
+session_*.mp3
+session_*.wav
+session_*.webm
+session_*.flac
+session_*.ogg
+session_*.txt
